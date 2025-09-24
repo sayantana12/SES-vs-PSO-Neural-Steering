@@ -1,0 +1,201 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import trange
+from scipy.stats import ttest_ind
+
+# --- Core MultiRobotPathPlanner for SES/PSO comparison (No obstacles/animation for speed) ---
+class MultiRobotPathPlanner:
+    def __init__(self, use_pso=False, num_robots=8, workspace_size=40, 
+                 population_size=30, generations=100, seed=42):
+        self.num_robots = num_robots
+        self.workspace_size = workspace_size
+        self.population_size = population_size
+        self.generations = generations
+        self.use_pso = use_pso
+
+        np.random.seed(seed)
+        self.ksi_att = 0.5
+        self.ksi_rep = 0.3
+        self.input_size = 3
+        self.hidden_size = 10
+        self.output_size = 1
+        self.initialize_ann_structure()
+        self.generate_training_data()
+
+        self.loss_history = []
+        if self.use_pso:
+            self.train_ann_with_pso()
+        else:
+            self.train_ann_with_ses()
+
+    def initialize_ann_structure(self):
+        self.w1_size = self.input_size * self.hidden_size
+        self.b1_size = self.hidden_size
+        self.w2_size = self.hidden_size * self.output_size
+        self.b2_size = self.output_size
+        self.vector_size = self.w1_size + self.b1_size + self.w2_size + self.b2_size
+
+    def decode_ann(self, particle):
+        idx = 0
+        W1 = particle[idx : idx + self.w1_size].reshape(self.input_size, self.hidden_size)
+        idx += self.w1_size
+        b1 = particle[idx : idx + self.b1_size]
+        idx += self.b1_size
+        W2 = particle[idx : idx + self.w2_size].reshape(self.hidden_size, self.output_size)
+        idx += self.w2_size
+        b2 = particle[idx : idx + self.b2_size]
+        return W1, b1, W2, b2
+
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-np.clip(x, -500, 500)))
+    def tanh(self, x):
+        return np.tanh(np.clip(x, -500, 500))
+    def angle_diff(self, a, b):
+        return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+    def ann_forward(self, X, W1, b1, W2, b2):
+        hidden = self.sigmoid(np.dot(X, W1) + b1)
+        output = self.tanh(np.dot(hidden, W2) + b2) * np.pi
+        return output
+
+    def generate_training_data(self):
+        num_samples = 2000
+        self.X_train = np.zeros((num_samples, 3))
+        self.y_train = np.zeros(num_samples)
+        for i in range(num_samples):
+            goal_angle = np.random.uniform(-np.pi, np.pi)
+            crit_angle = np.random.uniform(-np.pi, np.pi)
+            crit_dist = np.random.uniform(1.0, 8.0 + 2.0)
+            F_att = self.ksi_att * crit_dist
+            F_rep = self.ksi_rep * ((1/crit_dist - 1/8.0) / (crit_dist**2)) if crit_dist < 8.0 else 0
+            deviation = np.arctan2(F_rep * np.sin(crit_angle) + F_att * np.sin(goal_angle),
+                                   F_rep * np.cos(crit_angle) + F_att * np.cos(goal_angle))
+            self.X_train[i] = [goal_angle, crit_angle, crit_dist]
+            self.y_train[i] = deviation
+
+    def diversity_penalty(self, population):
+        if len(population) <= 1:
+            return 0.0
+        centroid = np.mean(population, axis=0)
+        diversity = np.mean(np.linalg.norm(population - centroid, axis=1))
+        return 1.0 / (diversity + 1e-6)
+
+    def train_ann_with_ses(self):
+        population = np.random.uniform(-1, 1, (self.population_size, self.vector_size))
+        fitness_history = []
+        for generation in trange(self.generations, desc="SES"):
+            fitness_scores = []
+            for i in range(self.population_size):
+                W1, b1, W2, b2 = self.decode_ann(population[i])
+                y_pred = self.ann_forward(self.X_train, W1, b1, W2, b2).flatten()
+                mse = np.mean(self.angle_diff(self.y_train, y_pred)**2)
+                fitness_scores.append(mse)
+            fitness_scores = np.array(fitness_scores)
+            penalty = self.diversity_penalty(population)
+            total_fitness = fitness_scores + 0.1 * penalty
+            elite_idx = np.argmin(total_fitness)
+            elite = population[elite_idx]
+            new_population = [elite.copy()]
+            while len(new_population) < self.population_size:
+                mutation = np.random.normal(0, 0.1, size=self.vector_size)
+                child = elite + mutation
+                new_population.append(np.clip(child, -5, 5))
+            population = np.array(new_population)
+            fitness_history.append(np.min(fitness_scores))
+        self.loss_history = fitness_history
+
+    def train_ann_with_pso(self):
+        population = np.random.uniform(-1, 1, (self.population_size, self.vector_size))
+        velocities = np.zeros_like(population)
+        p_best = population.copy()
+        p_best_scores = np.full(self.population_size, np.inf)
+        g_best = None
+        g_best_score = np.inf
+        fitness_history = []
+
+        w_init = 0.9
+        w_final = 0.4
+        c1 = c2 = 1.49445
+        v_clamp = 1.0
+
+        for gen in trange(self.generations, desc="PSO"):
+            w = w_init - (w_init - w_final) * (gen / self.generations)
+            for i in range(self.population_size):
+                W1, b1, W2, b2 = self.decode_ann(population[i])
+                y_pred = self.ann_forward(self.X_train, W1, b1, W2, b2).flatten()
+                mse = np.mean(self.angle_diff(self.y_train, y_pred) ** 2)
+                penalty = self.diversity_penalty(population)
+                fitness = mse + 0.05 * penalty
+                if fitness < p_best_scores[i]:
+                    p_best[i] = population[i]
+                    p_best_scores[i] = fitness
+                if fitness < g_best_score:
+                    g_best = population[i]
+                    g_best_score = fitness
+            for i in range(self.population_size):
+                r1, r2 = np.random.rand(self.vector_size), np.random.rand(self.vector_size)
+                velocities[i] = w * velocities[i] \
+                                + c1 * r1 * (p_best[i] - population[i]) \
+                                + c2 * r2 * (g_best - population[i])
+                velocities[i] = np.clip(velocities[i], -v_clamp, v_clamp)
+                population[i] = np.clip(population[i] + velocities[i], -5, 5)
+            # Occasional mutation
+            if gen % 20 == 0:
+                idxs = np.random.choice(self.population_size, 2, replace=False)
+                for idx in idxs:
+                    mutation = np.random.normal(0, 0.1, size=self.vector_size)
+                    population[idx] = np.clip(population[idx] + mutation, -5, 5)
+            fitness_history.append(g_best_score)
+        self.loss_history = fitness_history
+
+def run_experiments(n_repeats=5, plot_curves=True):
+    all_ses_loss, all_pso_loss = [], []
+    min_ses, min_pso = [], []
+
+    for seed in range(n_repeats):
+        planner_ses = MultiRobotPathPlanner(use_pso=False, generations=100, seed=seed)
+        planner_pso = MultiRobotPathPlanner(use_pso=True, generations=100, seed=seed)
+        all_ses_loss.append(planner_ses.loss_history)
+        all_pso_loss.append(planner_pso.loss_history)
+        min_ses.append(planner_ses.loss_history[-1])
+        min_pso.append(planner_pso.loss_history[-1])
+
+    all_ses_loss = np.array(all_ses_loss)
+    all_pso_loss = np.array(all_pso_loss)
+    min_ses = np.array(min_ses)
+    min_pso = np.array(min_pso)
+    
+    if plot_curves:
+        plt.figure(figsize=(10,6))
+        plt.plot(np.mean(all_ses_loss, axis=0), label='SES (mean over runs)')
+        plt.plot(np.mean(all_pso_loss, axis=0), label='PSO (mean over runs)')
+        plt.fill_between(range(100), 
+                         np.mean(all_ses_loss, axis=0)-np.std(all_ses_loss, axis=0),
+                         np.mean(all_ses_loss, axis=0)+np.std(all_ses_loss, axis=0),
+                         alpha=0.15, color='blue')
+        plt.fill_between(range(100), 
+                         np.mean(all_pso_loss, axis=0)-np.std(all_pso_loss, axis=0),
+                         np.mean(all_pso_loss, axis=0)+np.std(all_pso_loss, axis=0),
+                         alpha=0.15, color='orange')
+        plt.xlabel("Generation")
+        plt.ylabel("MSE")
+        plt.title("Training Loss: SES vs PSO (mean ± std over {} runs)".format(n_repeats))
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+    print(f"Min MSE over {n_repeats} runs (mean ± std):")
+    print(f"SES: {min_ses.mean():.5f} ± {min_ses.std():.5f}")
+    print(f"PSO: {min_pso.mean():.5f} ± {min_pso.std():.5f}")
+
+    # Statistical significance test
+    t_val, p_val = ttest_ind(min_ses, min_pso)
+    print("t-test: t = {:.3f}, p = {:.5f}".format(t_val, p_val))
+    if min_ses.mean() < min_pso.mean():
+        print("SES outperforms PSO on this problem.")
+    elif min_pso.mean() < min_ses.mean():
+        print("PSO outperforms SES on this problem.")
+    else:
+        print("No clear winner.")
+
+run_experiments(n_repeats=7)
